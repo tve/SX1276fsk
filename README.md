@@ -48,3 +48,10 @@ measurements as well as AGC/AFC. (The LoRa mode fixes this crap.) Here are my no
   restarts RX if no sync-address match occurs within a couple of milliseconds.
 - From the point of view of capturing RSSI/AFC/AGC it would be possible to use sync-address match
   interrupt on DIO2, however this doesn't provide an opportunity to fix the locked AFC/AGC issue.
+
+Reset
+-----
+Connecting the radio's reset pin is not strictly required as it has a proper power-on reset.
+However, while experiementing, it is possible to get the radio into odd non-functional states that
+can only be cleared by a hardware reset. If the driver is used without modification the probably that
+this occurs is very small.

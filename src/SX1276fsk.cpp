@@ -6,7 +6,7 @@
 #include <SPI.h>
 #include "SX1276fsk.h"
 
-static SPISettings spiSettings;
+static SPISettings spiSettings(4000000, SPI_MSBFIRST, SPI_MODE0);
 
 uint8_t SX1276fsk::rwReg(uint8_t cmd, uint8_t val) {
     spi.beginTransaction(spiSettings);
@@ -21,16 +21,14 @@ uint8_t SX1276fsk::rwReg(uint8_t cmd, uint8_t val) {
 void SX1276fsk::setMode (uint8_t newMode) {
     // disable interrupts (dio0->none)
     writeReg(REG_DIOMAPPING1, 0xB0);
-    mode = newMode;
-    writeReg(REG_OPMODE, (readReg(REG_OPMODE) & 0x7) | newMode);
-    if (mode == MODE_RECEIVE) {
-        writeReg(REG_IRQFLAGS1, 0xff);
+    writeReg(REG_OPMODE, (readReg(REG_OPMODE) & ~0x7) | newMode);
+    if (newMode == MODE_RECEIVE) {
+        // ensure RX really restarts and does AFC,AGC, etc. (seems to make a difference!?)
+        restartRx();
         // enable interrupts (dio0->payload-ready, dio4->preamble)
         writeReg(REG_DIOMAPPING1, 0x0C);
-        // ensure RX really restarts and does AFC,AGC, etc.
-        writeReg(REG_RXCONFIG, 0x9E|0x40); // restart RX
-        writeReg(REG_AFCFEI, 3); // clear AFC regs
     }
+    mode = newMode;
 }
 
 // FS->TX takes 65us, FS->RX takes 100us
@@ -100,6 +98,7 @@ static const uint8_t RF96configRegs [] = {
     0x32, 255,  // max RX packet length
     0x35, 0x8F, // start TX when FIFO has 1 byte, FifoLevel intr when 15 bytes in FIFO
     0x41, 0xF1, // dio5->mode-ready, dio4->preamble-detect intr
+    0x41, 0xE1, // dio5->data, dio4->preamble-detect intr
     0x44, 0x00, // no fast-hop
     0x4D, 0x07, // enable 20dBm tx power
     0
@@ -115,11 +114,15 @@ void SX1276fsk::init (uint8_t id, uint8_t group, int freq) {
     parity = (parity ^ (parity << 2)) & 0xC0;
 
     if (reset > 0) {
+        pinMode(reset, OUTPUT);
         digitalWrite(reset, LOW);
         delay(10);
         digitalWrite(reset, HIGH);
         delay(20);
     }
+
+    pinMode(ss, OUTPUT);
+    digitalWrite(ss, HIGH);
 
     do
         writeReg(REG_SYNCVALUE1, 0xAA);
@@ -132,10 +135,10 @@ void SX1276fsk::init (uint8_t id, uint8_t group, int freq) {
     setFrequency(freq);
 
     writeReg(REG_SYNCVALUE3, group);
-
 }
 
-void IRAM_ATTR SX1276fsk::interrupt0() { intr0 = true; }
+static volatile uint32_t intr0At = 0;
+void IRAM_ATTR SX1276fsk::interrupt0() { intr0 = true; intr0At = micros(); }
 void IRAM_ATTR SX1276fsk::interrupt4() { intr4 = true; }
 
 void SX1276fsk::setIntrPins(int8_t dio0_, int8_t dio4_) {
@@ -144,6 +147,7 @@ void SX1276fsk::setIntrPins(int8_t dio0_, int8_t dio4_) {
         dio0 = dio0_;
         intr0 = false;
         if (dio0 >= 0) {
+            pinMode(dio0, INPUT);
             attachInterrupt(dio0, std::bind(&SX1276fsk::interrupt0, this), RISING);
         }
     }
@@ -151,7 +155,10 @@ void SX1276fsk::setIntrPins(int8_t dio0_, int8_t dio4_) {
         if (dio4 >= 2) detachInterrupt(dio4);
         dio4 = dio4_;
         intr4 = false;
-        if (dio4 >= 0) attachInterrupt(dio4, std::bind(&SX1276fsk::interrupt4, this), RISING);
+        if (dio4 >= 0) {
+            pinMode(dio4, INPUT);
+            attachInterrupt(dio4, std::bind(&SX1276fsk::interrupt4, this), RISING);
+        }
     }
 }
 
@@ -182,10 +189,11 @@ void SX1276fsk::readRSSI() {
     int16_t f = (uint16_t)readReg(REG_AFCMSB);
     f = (f<<8) | (uint16_t)readReg(REG_AFCLSB);
     afc = (int32_t)f * 61;
-    rssiAt = millis();
+    rssiAt = micros();
 }
 
 int SX1276fsk::readPacket(void* ptr, int len) {
+    //uint32_t dt = micros() - intr0At;
     spi.beginTransaction(spiSettings);
     digitalWrite(ss, LOW);
     spi.write(REG_FIFO);
@@ -199,13 +207,15 @@ int SX1276fsk::readPacket(void* ptr, int len) {
     digitalWrite(ss, HIGH);
     spi.endTransaction();
     // flag stale RSSI
-    if (millis()-rssiAt > 60) {
-        printf("!RSSI stale:%ld!", millis()-rssiAt);
+    if (micros()-rssiAt > 60000) {
+        printf("!RSSI stale:%ldus!", micros()-rssiAt);
         rssi = 0;
         afc = 0;
         lna = 0;
     }
     // need to restartRX to get proper fresh AFC/AGC
+    //uint32_t dt2 = micros() - intr0At;
+    //printf("!RX:%luus:%luus!", dt, micros()-intr0At);
     restartRx();
 
     // only accept packets intended for us, or broadcasts
@@ -225,12 +235,15 @@ void SX1276fsk::restartRx() {
     lastFlag = 0;
     rssiAt = 0;
     writeReg(REG_RXCONFIG, 0x9E|0x40); // restart RX
+    //writeReg(REG_AFCFEI, 0x13); // restart AFC/AGC
 }
 
 bool SX1276fsk::transmitting() {
     if (mode != MODE_TRANSMIT) return false;
+    //printf("?TX:%d:%02x?", readReg(REG_OPMODE)&0x7, readReg(REG_IRQFLAGS2));
     if ((readReg(REG_IRQFLAGS2) & IRQ2_PACKETSENT) == 0) return true;
-    mode = MODE_STANDBY; // TODO: verify that radio auto-switches to standby
+    setMode(MODE_STANDBY);
+    //while (!modeReady()) delayMicroseconds(10);
     return false;
 }
 
@@ -241,10 +254,8 @@ bool SX1276fsk::receiving() {
 }
 
 int SX1276fsk::receive(void* ptr, int len) {
-    if (transmitting()) return false;
-
     if (mode != MODE_RECEIVE) {
-        restartRx();
+        if (transmitting()) return -1;
         rssi = 0;
         lna = 0;
         afc = 0;
@@ -255,7 +266,6 @@ int SX1276fsk::receive(void* ptr, int len) {
     // if a packet has started, read the RSSI, AFC, etc stats
     if (intr4) {
         // got an SyncAddr interrupt, need to read RSSI, AFC, etc.
-        rssiAt = millis();
         readRSSI();
         //printf("!RSSI%d!", -rssi/2);
         intr4 = false;
@@ -283,12 +293,14 @@ int SX1276fsk::receive(void* ptr, int len) {
         }
     }
 
+#if 1
     // if we don't get a packet (sync address match) within a few ms restart RX so we end up getting
     // a fresh AFC/AGC for the next actual packet.
     // Preamble+sync is 5+3=8 bytes, @49230 baud that's 1.3ms.
-    if (rssiAt != 0 && millis()-rssiAt > 4 && (readReg(REG_IRQFLAGS1)&IRQ1_SYNADDRMATCH) == 0) {
+    if (rssiAt != 0 && micros()-rssiAt > 1800 && (readReg(REG_IRQFLAGS1)&IRQ1_SYNADDRMATCH) == 0) {
         restartRx();
     }
+#endif
 
     return -1;
 }
@@ -297,6 +309,9 @@ bool SX1276fsk::send (uint8_t header, const void* ptr, int len) {
     if (receiving()) return false;
 
     setMode(MODE_FSTX);
+    // need to wait, else stuffing FIFO may not work; alternative would be to go to standby, but
+    // then we loose PLL sync(?)
+    while (!modeReady()) ;
 
     spi.beginTransaction(spiSettings);
     digitalWrite(ss, LOW);
