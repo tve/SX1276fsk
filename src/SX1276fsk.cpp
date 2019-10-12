@@ -2,7 +2,7 @@
 // Copyright (c) 2019 by Thorsten von Eicken, see LICENSE file
 
 #include <Arduino.h>
-#include <FunctionalInterrupt.h>
+//#include <FunctionalInterrupt.h>
 #include <SPI.h>
 #include "SX1276fsk.h"
 
@@ -79,7 +79,7 @@ static const uint8_t RF96configRegs [] = {
     0x0D, 0x9E, // AFC on, AGC on, AGC&AFC on preamble detect
     0x0E, 0x04, // 32-sample rssi smoothing (5 bit times)
     0x0F, 0x0A, // 10dB RSSI collision threshold
-    0x10, 90*2, // RSSI threshold
+    //0x10, rssiThres*2, // RSSI threshold
     0x12, 0x52, // RxBW 83kHz
     0x13, 0x4A, // AfcBw 125kHz
     0x1A, 0x01, // clear AFC at start of RX
@@ -98,7 +98,6 @@ static const uint8_t RF96configRegs [] = {
     0x32, 255,  // max RX packet length
     0x35, 0x8F, // start TX when FIFO has 1 byte, FifoLevel intr when 15 bytes in FIFO
     0x41, 0xF1, // dio5->mode-ready, dio4->preamble-detect intr
-    0x41, 0xE1, // dio5->data, dio4->preamble-detect intr
     0x44, 0x00, // no fast-hop
     0x4D, 0x07, // enable 20dBm tx power
     0
@@ -133,13 +132,25 @@ void SX1276fsk::init (uint8_t id, uint8_t group, int freq) {
 
     configure(RF96configRegs);
     setFrequency(freq);
+    writeReg(REG_RSSITHRES, 2*90);
+    bgRssi = readReg(REG_RSSITHRES) << 4;
+    bgRssiAt = micros();
 
     writeReg(REG_SYNCVALUE3, group);
 }
 
+// Interrupt woes... On the ESP32 (and ESP8266) the interrupt handlers have to be in IRAM, hence the
+// IRAM_ATTR. This doesn't play well with using class methods as interrupt handlers because
+// std::bind (and probably other mothods as well) generate some stub code to go from a function
+// pointer to a method call and this stub code is not in IRAM. A good test is perfoming an OTA while
+// interrupts are happening: if any non IRAM code is involved the pgm will crash very rapidly.
+// TODO: to support multiple radios an explicit 'this' parameter would need to be passed to the
+// interrupt handlers...
+
+static volatile bool intr0, intr4;
 static volatile uint32_t intr0At = 0;
-void IRAM_ATTR SX1276fsk::interrupt0() { intr0 = true; intr0At = micros(); }
-void IRAM_ATTR SX1276fsk::interrupt4() { intr4 = true; }
+static void IRAM_ATTR interrupt0() { intr0 = true; intr0At = micros(); }
+static void IRAM_ATTR interrupt4() { intr4 = true; }
 
 void SX1276fsk::setIntrPins(int8_t dio0_, int8_t dio4_) {
     if (dio0_ != dio0) {
@@ -148,7 +159,7 @@ void SX1276fsk::setIntrPins(int8_t dio0_, int8_t dio4_) {
         intr0 = false;
         if (dio0 >= 0) {
             pinMode(dio0, INPUT);
-            attachInterrupt(dio0, std::bind(&SX1276fsk::interrupt0, this), RISING);
+            attachInterrupt(dio0, interrupt0, RISING);
         }
     }
     if (dio4_ != dio4) {
@@ -157,7 +168,8 @@ void SX1276fsk::setIntrPins(int8_t dio0_, int8_t dio4_) {
         intr4 = false;
         if (dio4 >= 0) {
             pinMode(dio4, INPUT);
-            attachInterrupt(dio4, std::bind(&SX1276fsk::interrupt4, this), RISING);
+            attachInterrupt(dio4, interrupt4, RISING);
+            //attachInterrupt(dio4, std::bind(&SX1276fsk::interrupt4, this), RISING);
         }
     }
 }
@@ -185,6 +197,8 @@ static uint8_t RF96lnaMap[] = { 0, 0, 6, 12, 24, 36, 48, 48 };
 
 void SX1276fsk::readRSSI() {
     rssi = readReg(REG_RSSIVALUE);
+    int16_t thres = readReg(REG_RSSITHRES);
+    snr = rssi > thres ? 0 : (thres-rssi)/2;
     lna = RF96lnaMap[ (readReg(REG_LNAVALUE) >> 5) & 0x7 ];
     int16_t f = (uint16_t)readReg(REG_AFCMSB);
     f = (f<<8) | (uint16_t)readReg(REG_AFCLSB);
@@ -193,7 +207,21 @@ void SX1276fsk::readRSSI() {
 }
 
 int SX1276fsk::readPacket(void* ptr, int len) {
-    //uint32_t dt = micros() - intr0At;
+    uint32_t dt = micros() - intr0At;
+    gettimeofday(&rxAt, 0);
+    if (rxAt.tv_sec < 1500000000) {
+        // we don't seem to have the real time :-(
+        rxAt.tv_sec = 0;
+        rxAt.tv_usec = 0;
+    } else {
+        // adjust current time for the delta since we saw the RX interrupt
+        rxAt.tv_sec -= dt/1000000;
+        rxAt.tv_usec -= dt%1000000;
+        while (rxAt.tv_usec < 0) {
+            rxAt.tv_usec += 1000000;
+            rxAt.tv_sec--;
+        }
+    }
     spi.beginTransaction(spiSettings);
     digitalWrite(ss, LOW);
     spi.write(REG_FIFO);
@@ -210,6 +238,7 @@ int SX1276fsk::readPacket(void* ptr, int len) {
     if (micros()-rssiAt > 60000) {
         printf("!RSSI stale:%ldus!", micros()-rssiAt);
         rssi = 0;
+        snr = 0;
         afc = 0;
         lna = 0;
     }
@@ -257,15 +286,18 @@ int SX1276fsk::receive(void* ptr, int len) {
     if (mode != MODE_RECEIVE) {
         if (transmitting()) return -1;
         rssi = 0;
+        snr = 0;
         lna = 0;
         afc = 0;
+        rxAt.tv_sec = 0;
+        rxAt.tv_usec = 0;
         setMode(MODE_RECEIVE);
         return -1;
     }
 
     // if a packet has started, read the RSSI, AFC, etc stats
     if (intr4) {
-        // got an SyncAddr interrupt, need to read RSSI, AFC, etc.
+        // got a preamble-detect interrupt, need to read RSSI, AFC, etc.
         readRSSI();
         //printf("!RSSI%d!", -rssi/2);
         intr4 = false;
@@ -294,11 +326,27 @@ int SX1276fsk::receive(void* ptr, int len) {
     }
 
 #if 1
-    // if we don't get a packet (sync address match) within a few ms restart RX so we end up getting
-    // a fresh AFC/AGC for the next actual packet.
+    // if the radio detected a preamble and it doesn't get a packet (sync address match) within a
+    // few ms restart RX so it performs a fresh AFC/AGC for the next actual packet.
     // Preamble+sync is 5+3=8 bytes, @49230 baud that's 1.3ms.
-    if (rssiAt != 0 && micros()-rssiAt > 1800 && (readReg(REG_IRQFLAGS1)&IRQ1_SYNADDRMATCH) == 0) {
+    bool synAddrMatch = (readReg(REG_IRQFLAGS1)&IRQ1_SYNADDRMATCH) != 0;
+    uint32_t uNow = micros();
+    if (rssiAt != 0 && uNow-rssiAt > 1800 && !synAddrMatch) {
         restartRx();
+        printf("SX1276fsk: RX restart (RSSI thres is %ddBm)\n", -readReg(REG_RSSITHRES)/2);
+
+    // read RSSI and do some smoothed tracking of background noise
+    } else if (!synAddrMatch && uNow-bgRssiAt > 10*1000) {
+        uint16_t r = bgRssi>>4;
+        uint16_t v = readReg(REG_RSSIVALUE);
+        if (v > 2*70 && v < 2*100) { // reject non-sensical values
+            bgRssi = ((bgRssi*15) + (v<<4)) >>4; // exponential smoothing
+            bgRssiAt = uNow;
+            if ((bgRssi>>4) != r) {
+                //printf("SD1276fsk: bgRssi %d->%d (%d)\n", r, bgRssi>>4, v);
+                writeReg(REG_RSSITHRES, (bgRssi>>4)+2*2); // set threshold a couple of dB above noise
+            }
+        }
     }
 #endif
 

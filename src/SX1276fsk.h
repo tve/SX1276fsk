@@ -1,6 +1,8 @@
 // RFM96 / sx1276 FSK driver
 // Copyright (c) 2019 by Thorsten von Eicken, see LICENSE file
 
+#include <sys/time.h>
+
 class SX1276fsk {
 public:
     SX1276fsk(SPIClass &spi_, int8_t ss_, int8_t reset_=-1)
@@ -29,7 +31,9 @@ public:
     // sleep puts the radio to sleep to save power
     void sleep();
 
+    struct timeval rxAt; // timestamp of packet reception
     int32_t afc;    // AFC freq correction applied
+    uint8_t snr;    // in dB
     uint8_t rssi;   // -RSSI*2 of last packet received
     uint8_t lna;    // LNA attenuation in dB
     uint8_t myId;
@@ -48,6 +52,7 @@ public:
         REG_PACONFIG      = 0x09,
         REG_LNAVALUE      = 0x0C,
         REG_RXCONFIG      = 0x0D,
+        REG_RSSITHRES     = 0x10,
         REG_AFCFEI        = 0x1A,
         REG_AFCMSB        = 0x1B,
         REG_AFCLSB        = 0x1C,
@@ -96,13 +101,20 @@ public:
     void restartRx();
     bool transmitting();
     bool receiving();
-    void interrupt0();
-    void interrupt4();
+    //void interrupt0();
+    //void interrupt4();
 
-    uint8_t mode;
+    uint8_t mode; // last operation mode programmed into the radio
     SPIClass &spi;
-    int8_t ss, reset, dio0, dio4;
-    bool intr0, intr4;
-    uint8_t lastFlag;
-    uint32_t rssiAt;
+    int8_t ss, reset, dio0, dio4; // pin numbers
+    uint8_t lastFlag; //
+    uint32_t rssiAt;  // timestamp when RSSI was captured
+    uint32_t  bgRssiAt; // last bgRssi measurement (micros())
+    uint16_t  bgRssi; // background (noise) RSSI
+
 };
+
+
+int encodeVarints(int32_t ints[], int count, uint8_t *buf, int len);
+int decodeVarints(uint8_t buf[], int len, int32_t *ints, int count);
+int decodeVarint(uint8_t buf[], int len, int32_t *value);
