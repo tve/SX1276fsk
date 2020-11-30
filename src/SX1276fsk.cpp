@@ -80,10 +80,10 @@ static const uint8_t RF96configRegs [] = {
     0x0E, 0x04, // 32-sample rssi smoothing (5 bit times)
     0x0F, 0x0A, // 10dB RSSI collision threshold
     //0x10, rssiThres*2, // RSSI threshold
-    0x12, 0x52, // RxBW 83kHz
-    0x13, 0x4A, // AfcBw 125kHz
+    0x12, 0x12, // RxBW 83kHz
+    0x13, 0x0A, // AfcBw 125kHz
     0x1A, 0x01, // clear AFC at start of RX
-    0x1F, 0xCA, // 3 byte preamble detector, tolerate 10 chip errors (2.5 bits)
+    0x1F, 0xA8, // 2 byte preamble detector, tolerate 8 chip errors
     0x20, 0x00, // No RX timeout if RSSI doesn't happen
     0x21, 0x00, // No RX timeout if no preamble
     0x22, 0x00, // No RX timeout if no sync
@@ -336,7 +336,7 @@ int SX1276fsk::receive(void* ptr, int len) {
         printf("SX1276fsk: RX restart (RSSI thres is %ddBm)\n", -readReg(REG_RSSITHRES)/2);
 
     // read RSSI and do some smoothed tracking of background noise
-    } else if (!synAddrMatch && uNow-bgRssiAt > 10*1000) {
+    } else if (rssiAt == 0 && !synAddrMatch && uNow-bgRssiAt > 10*1000) {
         uint16_t r = bgRssi>>4;
         uint16_t v = readReg(REG_RSSIVALUE);
         if (v > 2*70 && v < 2*100) { // reject non-sensical values

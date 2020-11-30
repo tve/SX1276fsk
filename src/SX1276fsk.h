@@ -87,7 +87,7 @@ public:
         IRQ1_PREAMBLEDETECT=1<<1,
         IRQ1_SYNADDRMATCH = 1<<0,
 
-        IRQ2_FIFONOTEMPTY = 1<<6,
+        IRQ2_FIFOEMPTY    = 1<<6,
         IRQ2_PACKETSENT   = 1<<3,
         IRQ2_PAYLOADREADY = 1<<2,
     };
